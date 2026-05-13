@@ -1,0 +1,235 @@
+"""
+title: Token Rate Limit Filter
+author: assistant
+author_url: https://github.com/ArtemYatsyuk
+funding_url: https://github.com/ArtemYatsyuk/Token-Rate-Limit-Filter
+version: 1
+description: Limits non-admin users to a configurable token budget per rolling time window (in minutes). Admins are exempt. Counts only NEW user input + assistant output (not full chat context).
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, List
+import time
+import math
+
+
+class Filter:
+    class Valves(BaseModel):
+        priority: int = Field(
+            default=0, description="Priority level for the filter operations."
+        )
+        token_limit: int = Field(
+            default=100000,
+            description="Maximum number of tokens a user can consume within the time window.",
+        )
+        time_window_minutes: int = Field(
+            default=300,
+            description="Rolling time window in minutes (default 300 = 5 hours).",
+        )
+        pass
+
+    class UserValves(BaseModel):
+        pass
+
+    def __init__(self):
+        self.valves = self.Valves()
+        # {user_id: {"buckets": [(timestamp, token_count), ...], "total": int}}
+        self.user_usage: Dict[str, Dict] = {}
+
+        # Try loading tiktoken for accurate counting
+        self.encoder = None
+        try:
+            import tiktoken
+
+            self.encoder = tiktoken.get_encoding("cl100k_base")
+        except ImportError:
+            print(
+                f"[{__name__}] tiktoken not installed - using character-based estimation."
+            )
+        except Exception as e:
+            print(
+                f"[{__name__}] tiktoken init error: {e} - using character-based estimation."
+            )
+
+    # =========================== helpers ===========================
+
+    def _count_tokens_text(self, text: str) -> int:
+        if not text:
+            return 0
+        if self.encoder:
+            try:
+                return len(self.encoder.encode(text))
+            except Exception:
+                pass
+        return max(1, len(text) // 4)
+
+    def _count_single_message_tokens(self, message: dict) -> int:
+        """Count tokens for ONE message only (no chat context)."""
+        if not message:
+            return 0
+        total = 4  # per-message overhead
+        content = message.get("content", "")
+        if isinstance(content, str):
+            total += self._count_tokens_text(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        total += self._count_tokens_text(part.get("text", ""))
+                    elif part.get("type") == "image_url":
+                        total += 85
+        return total
+
+    def _get_last_user_message(self, messages: List[dict]) -> Optional[dict]:
+        """Return only the most recent user message (the new input)."""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                return msg
+        return None
+
+    def _prune_and_sum(self, user_id: str) -> int:
+        if user_id not in self.user_usage:
+            return 0
+        cutoff = time.time() - (self.valves.time_window_minutes * 60)
+        buckets = self.user_usage[user_id]["buckets"]
+        pruned = [(ts, count) for ts, count in buckets if ts > cutoff]
+        total = sum(count for _, count in pruned)
+        self.user_usage[user_id]["buckets"] = pruned
+        self.user_usage[user_id]["total"] = total
+        return total
+
+    def _record_tokens(self, user_id: str, token_count: int):
+        now = time.time()
+        if user_id not in self.user_usage:
+            self.user_usage[user_id] = {"buckets": [], "total": 0}
+        self.user_usage[user_id]["buckets"].append((now, token_count))
+        self.user_usage[user_id]["total"] = self._prune_and_sum(user_id)
+
+    def _get_oldest_bucket_expiry(self, user_id: str) -> float:
+        if user_id not in self.user_usage or not self.user_usage[user_id]["buckets"]:
+            return 0.0
+        oldest_ts = self.user_usage[user_id]["buckets"][0][0]
+        expiry = oldest_ts + (self.valves.time_window_minutes * 60)
+        return max(0.0, expiry - time.time())
+
+    def _format_duration(self, seconds: float) -> str:
+        if seconds <= 0:
+            return "a few seconds"
+        total_seconds = int(math.ceil(seconds))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+
+        if hours > 0 and minutes > 0:
+            return f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+        if hours > 0:
+            return f"{hours} hour{'s' if hours != 1 else ''}"
+        if minutes > 0:
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        return f"{secs} second{'s' if secs != 1 else ''}"
+
+    def _cleanup_all(self):
+        cutoff = time.time() - (self.valves.time_window_minutes * 60)
+        expired = [
+            uid
+            for uid, data in self.user_usage.items()
+            if not data["buckets"] or data["buckets"][-1][0] <= cutoff
+        ]
+        for uid in expired:
+            del self.user_usage[uid]
+
+    # =========================== inlet ===========================
+
+    def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        if __user__ is None:
+            return body
+
+        user_role = __user__.get("role", "user")
+        user_id = __user__.get("id", "unknown")
+        user_name = __user__.get("name", user_id)
+
+        if user_role == "admin":
+            return body
+
+        self._cleanup_all()
+
+        current_usage = self._prune_and_sum(user_id)
+        token_limit = self.valves.token_limit
+
+        messages = body.get("messages", [])
+
+        # Count ONLY the latest user message (not chat context)
+        last_user_msg = self._get_last_user_message(messages)
+        request_tokens = (
+            self._count_single_message_tokens(last_user_msg) if last_user_msg else 0
+        )
+
+        # ---- Hard limit reached ----
+        if current_usage >= token_limit:
+            wait_str = self._format_duration(self._get_oldest_bucket_expiry(user_id))
+            print(
+                f"[{__name__}] BLOCKED (limit reached) | user={user_name} ({user_id}) | "
+                f"usage={current_usage:,}/{token_limit:,} | retry_in={wait_str}"
+            )
+            raise Exception(f"Rate limit reached. Try again in {wait_str}.")
+
+        # ---- Would exceed limit ----
+        if current_usage + request_tokens > token_limit:
+            wait_str = self._format_duration(self._get_oldest_bucket_expiry(user_id))
+            print(
+                f"[{__name__}] BLOCKED (would exceed) | user={user_name} ({user_id}) | "
+                f"usage={current_usage:,}+{request_tokens:,}>{token_limit:,} | retry_in={wait_str}"
+            )
+            raise Exception(f"Rate limit reached. Try again in {wait_str}.")
+
+        # ---- Record input tokens (new message only) ----
+        self._record_tokens(user_id, request_tokens)
+        current_usage += request_tokens
+
+        print(
+            f"[{__name__}] inlet | user={user_name} ({user_id}) | "
+            f"+{request_tokens} req tokens | total={current_usage:,}/{token_limit:,}"
+        )
+
+        return body
+
+    # =========================== outlet ===========================
+
+    def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        if __user__ is None:
+            return body
+
+        user_role = __user__.get("role", "user")
+        user_id = __user__.get("id", "unknown")
+        user_name = __user__.get("name", user_id)
+
+        if user_role == "admin":
+            return body
+
+        messages = body.get("messages", [])
+        if not messages:
+            return body
+
+        # Find the latest assistant message (the new response only)
+        last_assistant = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "assistant":
+                last_assistant = messages[i]
+                break
+
+        if last_assistant is None:
+            return body
+
+        # Count ONLY the latest assistant response (not chat context)
+        response_tokens = self._count_single_message_tokens(last_assistant)
+        self._record_tokens(user_id, response_tokens)
+
+        current_usage = self._prune_and_sum(user_id)
+        token_limit = self.valves.token_limit
+
+        print(
+            f"[{__name__}] outlet | user={user_name} ({user_id}) | "
+            f"+{response_tokens} resp tokens | total={current_usage:,}/{token_limit:,}"
+        )
+
+        return body
